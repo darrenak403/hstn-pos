@@ -1,0 +1,396 @@
+// Seafood POS — schema chốt sau các vòng review Plan→Review.
+// Quyết định quan trọng được ghi chú tại chỗ; xem thêm docs/adr/*.md (sẽ bổ sung ở bước sau).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Identity & Auth
+// ─────────────────────────────────────────────────────────────────────────
+
+enum Role {
+  ADMIN
+  SELLER
+}
+
+model User {
+  id           String   @id @default(uuid())
+  username     String   @unique
+  passwordHash String
+  displayName  String
+  role         Role
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+
+  refreshTokens              RefreshToken[]
+  auditLogs                  AuditLog[]               @relation("AuditActor")
+  createdPackages            Package[]                @relation("PackageCreatedBy")
+  createdStockInSessions     StockInSession[]          @relation("StockInSessionCreatedBy")
+  createdOrders              Order[]                  @relation("OrderCreatedBy")
+  cancelledOrders            Order[]                  @relation("OrderCancelledBy")
+  createdInventoryTxns       InventoryTransaction[]    @relation("InventoryTxnCreatedBy")
+  priceOverridesApproved     StockInLineAudit[]        @relation("PriceOverrideApprovedBy")
+}
+
+// Refresh token: chỉ lưu hash (tra cứu bằng HMAC xác định, KHÔNG dùng bcrypt vì
+// cần tra cứu theo giá trị, không chỉ so khớp). Chuỗi token thật không bao giờ
+// được lưu ở đây — xem RefreshTokenGrace cho trường hợp phát-lại trong cửa sổ ân hạn.
+model RefreshToken {
+  id         String    @id @default(uuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  deviceId   String
+  deviceLabel String?
+  familyId   String    // nhóm chuỗi token được xoay liên tiếp của 1 phiên đăng nhập
+  tokenHash  String    @unique
+  createdAt  DateTime  @default(now())
+  expiresAt  DateTime
+
+  // CAS (compare-and-swap) để xoay token an toàn khi có nhiều request đồng thời:
+  // UPDATE ... SET consumedAt = now() WHERE consumedAt IS NULL  →  chỉ 1 request "thắng".
+  consumedAt       DateTime?
+  rotatedToTokenId String?
+
+  revokedAt     DateTime?
+  revokedReason RefreshTokenRevokedReason?
+
+  @@index([userId])
+  @@index([familyId])
+  @@index([deviceId])
+}
+
+enum RefreshTokenRevokedReason {
+  ROTATED
+  REUSE_DETECTED
+  DEVICE_MISMATCH
+  ADMIN_REVOKED
+  USER_INACTIVE
+  LOGOUT
+  EXPIRED_CLEANUP
+}
+
+// Giữ CHÍNH XÁC cặp token mới trong một cửa sổ ngắn sau khi xoay, để các request
+// đến muộn (do mất phản hồi mạng) hoặc đến đồng thời (thua trong CAS) nhận lại
+// được đúng kết quả thay vì bị coi là tấn công tái sử dụng token.
+// Khoá tra cứu là hash của token CŨ (dữ liệu xác định, không phụ thuộc client gửi
+// thêm header nào) + deviceId — không dùng ID do client tự sinh.
+model RefreshTokenGrace {
+  oldTokenHash      String   @id
+  userId            String
+  deviceId          String
+  // Mã hoá AES-256-GCM bằng AUTH_GRACE_ENCRYPTION_KEY (chỉ có trong env của API
+  // server, không nằm trong DB) — xem apps/api/src/auth/grace-encryption.ts.
+  // Review chỉ ra lưu plaintext ở đây nghĩa là đọc được DB = lấy được token còn
+  // dùng được trong cả cửa sổ ân hạn; mã hoá thu hẹp việc đó về "đọc được DB VÀ
+  // đọc được biến môi trường tiến trình API".
+  newAccessToken    String   // ciphertext (base64: iv|authTag|data), không phải plaintext
+  newRefreshToken   String   // ciphertext (base64: iv|authTag|data), chỉ tồn tại tới expiresAt
+  newRefreshTokenId String
+  expiresAt         DateTime
+
+  @@index([expiresAt])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Audit Log — actor CÓ THỂ rỗng (ví dụ đăng nhập sai với username không tồn tại)
+// ─────────────────────────────────────────────────────────────────────────
+
+enum AuditCategory {
+  BUSINESS
+  SECURITY
+}
+
+model AuditLog {
+  id       String        @id @default(uuid())
+  category AuditCategory
+  action   String // "ORDER_COMPLETED" | "LOGIN_FAILED" | "REFRESH_TOKEN_REUSE_DETECTED" | ...
+  success  Boolean       @default(true)
+
+  actorId                String?
+  actor                  User?   @relation("AuditActor", fields: [actorId], references: [id], onDelete: SetNull)
+  actorUsernameAttempted String? // username đã gõ, kể cả khi không tồn tại user nào khớp
+
+  entityType String?
+  entityId   String?
+  metadata   Json? // đã redact() trước khi ghi — xem apps/api/src/audit-log/redact.ts
+  ip         String?
+  userAgent  String?
+  deviceId   String?
+  createdAt  DateTime @default(now())
+
+  @@index([category, createdAt])
+  @@index([actorId, createdAt])
+  @@index([entityType, entityId])
+  @@index([action, createdAt])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Settings
+// ─────────────────────────────────────────────────────────────────────────
+
+model AppSetting {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Catalog
+// ─────────────────────────────────────────────────────────────────────────
+
+enum PricingType {
+  WEIGHT_BASED
+  FIXED_PACKAGE
+}
+
+model Category {
+  id        String   @id @default(uuid())
+  name      String
+  imageUrl  String?
+  icon      String?
+  sortOrder Int      @default(0)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  products Product[]
+}
+
+model Product {
+  id         String      @id @default(uuid())
+  categoryId String
+  category   Category    @relation(fields: [categoryId], references: [id])
+  name       String
+  imageUrl   String?
+  code       String      @unique
+  baseUnit   String      @default("kg")
+
+  pricingType          PricingType
+  // WEIGHT_BASED dùng 2 cột dưới; FIXED_PACKAGE dùng defaultFixedPrice.
+  // Service tầng trên PHẢI chặn set sai cặp theo pricingType (xem products module).
+  defaultPricePerUnit  Decimal?    @db.Decimal(18, 2)
+  defaultFixedPrice    Decimal?    @db.Decimal(18, 2)
+  estimatedCostPerUnit Decimal?    @db.Decimal(18, 2)
+
+  lowStockThreshold Int     @default(5)
+  packageSequence   Int     @default(0) // cấp mã Package atomic, xem stock-in service
+  isActive          Boolean @default(true)
+  createdAt         DateTime @default(now())
+
+  presets  PackagePreset[]
+  packages Package[]
+
+  @@index([categoryId, isActive])
+}
+
+model PackagePreset {
+  id        String  @id @default(uuid())
+  productId String
+  product   Product @relation(fields: [productId], references: [id])
+  name      String
+  weight    Decimal? @db.Decimal(10, 3)
+  // Đúng 1 trong 2 cột dưới có giá trị, tuỳ theo product.pricingType (xem §6 spec):
+  //   WEIGHT_BASED  → pricePerUnit (hoặc fixedPrice nếu mẫu này có giá cố định riêng, §7)
+  //   FIXED_PACKAGE → fixedPrice bắt buộc, pricePerUnit phải null
+  pricePerUnit Decimal? @db.Decimal(18, 2)
+  fixedPrice   Decimal? @db.Decimal(18, 2)
+  sortOrder    Int      @default(0)
+  isActive     Boolean  @default(true)
+
+  packages Package[]
+}
+
+enum PackageStatus {
+  IN_STOCK
+  SOLD
+  DAMAGED
+  REMOVED
+}
+
+// Vì sao giá hộp lại là giá này — dùng để Admin tra cứu và để test hồi quy pricing.
+enum PriceBasis {
+  OVERRIDE_PER_UNIT // WEIGHT_BASED, Seller/Admin nhập giá/kg khác cho lô này
+  PRESET_FIXED // khớp đúng cân nặng với 1 preset có giá cố định riêng (§7 spec)
+  PRESET_PER_UNIT // dùng giá/kg của preset
+  PRODUCT_PER_UNIT // dùng giá/kg mặc định của sản phẩm
+  OVERRIDE_FIXED // FIXED_PACKAGE, Seller/Admin nhập giá/hộp khác cho lô này
+  PRODUCT_FIXED // dùng giá cố định mặc định của sản phẩm
+}
+
+model Package {
+  id              String         @id @default(uuid())
+  productId       String
+  product         Product        @relation(fields: [productId], references: [id])
+  packagePresetId String? // null khi hộp lệch khỏi mọi preset (§9/§12 spec)
+  preset          PackagePreset? @relation(fields: [packagePresetId], references: [id])
+
+  code    String  @unique
+  barcode String? @unique
+
+  actualWeight Decimal  @db.Decimal(10, 3)
+  // null khi priceBasis thuộc nhóm FIXED (OVERRIDE_FIXED/PRESET_FIXED/PRODUCT_FIXED);
+  // có giá trị khi thuộc nhóm PER_UNIT. Ràng buộc chéo này thực thi ở tầng service
+  // (packages/utils/pricing.ts) — Prisma không biểu diễn được CHECK đa cột ở đây,
+  // xem prisma/migrations/manual/README.md để thêm CHECK bằng raw SQL sau migrate đầu.
+  pricePerUnit  Decimal?   @db.Decimal(18, 2)
+  sellingPrice  Decimal    @db.Decimal(18, 2)
+  priceBasis    PriceBasis
+  estimatedCost Decimal?   @db.Decimal(18, 2)
+
+  status PackageStatus @default(IN_STOCK)
+
+  stockInSessionId String?
+  stockInSession   StockInSession? @relation(fields: [stockInSessionId], references: [id])
+
+  createdAt   DateTime @default(now())
+  createdById String
+  createdBy   User     @relation("PackageCreatedBy", fields: [createdById], references: [id])
+
+  orderItems   OrderItem[]
+  transactions InventoryTransaction[]
+
+  @@index([productId, status])
+}
+
+model StockInSession {
+  id        String   @id @default(uuid())
+  code      String   @unique
+  note      String?
+  createdAt DateTime @default(now())
+
+  createdById String
+  createdBy   User   @relation("StockInSessionCreatedBy", fields: [createdById], references: [id])
+
+  packages   Package[]
+  lineAudits StockInLineAudit[]
+}
+
+// Ghi lại mỗi lần Seller/Admin ghi đè giá khi thêm hàng — dùng cho báo cáo
+// "Các lần đổi giá trong tuần" và đối chiếu biên độ ±20%.
+model StockInLineAudit {
+  id               String   @id @default(uuid())
+  stockInSessionId String
+  stockInSession   StockInSession @relation(fields: [stockInSessionId], references: [id])
+  productId        String
+  overrideType     PriceBasis // OVERRIDE_PER_UNIT hoặc OVERRIDE_FIXED
+  overrideValue    Decimal  @db.Decimal(18, 2)
+  defaultValue     Decimal? @db.Decimal(18, 2)
+  deviationPercent Decimal? @db.Decimal(6, 3)
+  withinThreshold  Boolean
+  approvedById     String?
+  approvedBy       User?    @relation("PriceOverrideApprovedBy", fields: [approvedById], references: [id])
+  createdAt        DateTime @default(now())
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Sales
+// ─────────────────────────────────────────────────────────────────────────
+
+enum OrderStatus {
+  COMPLETED
+  CANCELLED
+}
+
+enum PaymentStatus {
+  UNPAID
+  PAID
+}
+
+model Order {
+  id            String        @id @default(uuid())
+  code          String        @unique
+  status        OrderStatus   @default(COMPLETED)
+  totalAmount   Decimal       @db.Decimal(18, 2)
+  paymentStatus PaymentStatus @default(PAID)
+  createdAt     DateTime      @default(now())
+
+  createdById String
+  createdBy   User   @relation("OrderCreatedBy", fields: [createdById], references: [id])
+
+  cancelledAt  DateTime?
+  cancelledById String?
+  cancelledBy   User?     @relation("OrderCancelledBy", fields: [cancelledById], references: [id])
+  cancelReason  String?
+
+  items    OrderItem[]
+  payments Payment[]
+
+  @@index([createdAt])
+}
+
+model OrderItem {
+  id        String  @id @default(uuid())
+  orderId   String
+  order     Order   @relation(fields: [orderId], references: [id])
+  packageId String
+  package   Package @relation(fields: [packageId], references: [id])
+
+  productId String
+  // Snapshot tại thời điểm bán — §35 spec: đổi tên/giá sản phẩm sau này KHÔNG được
+  // làm thay đổi hoá đơn cũ.
+  productNameSnapshot   String
+  packageCodeSnapshot   String
+  weight                Decimal  @db.Decimal(10, 3)
+  unitPrice             Decimal? @db.Decimal(18, 2)
+  sellingPrice          Decimal  @db.Decimal(18, 2)
+  estimatedCostSnapshot Decimal? @db.Decimal(18, 2)
+
+  @@index([orderId])
+}
+
+enum PaymentMethod {
+  CASH
+  TRANSFER
+}
+
+model Payment {
+  id        String        @id @default(uuid())
+  orderId   String
+  order     Order         @relation(fields: [orderId], references: [id])
+  method    PaymentMethod
+  amount    Decimal       @db.Decimal(18, 2)
+  createdAt DateTime      @default(now())
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Inventory
+// ─────────────────────────────────────────────────────────────────────────
+
+enum InventoryTransactionType {
+  CREATE
+  SALE
+  SALE_REVERSED
+  DAMAGED
+  REMOVED
+}
+
+enum AdjustmentReason {
+  DAMAGED
+  PACKAGING_TORN
+  HOME_USE
+  GIFT
+  WRONG_ENTRY
+  STOCKTAKE_DIFF
+  OTHER
+}
+
+model InventoryTransaction {
+  id        String                   @id @default(uuid())
+  packageId String
+  package   Package                  @relation(fields: [packageId], references: [id])
+  type      InventoryTransactionType
+  reason    AdjustmentReason?
+  note      String?
+  orderId   String?
+  createdAt DateTime                 @default(now())
+
+  createdById String
+  createdBy   User   @relation("InventoryTxnCreatedBy", fields: [createdById], references: [id])
+
+  @@index([packageId, createdAt])
+}
