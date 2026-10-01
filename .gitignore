@@ -1,0 +1,11 @@
+node_modules/
+dist/
+build/
+.turbo/
+.env
+.env.local
+*.log
+coverage/
+.DS_Store
+src-tauri/target/
+prisma/migrations/dev-*
